@@ -10,12 +10,12 @@ import scanner as sc
 
 st.set_page_config(page_title="Zone Ticket", layout="centered")
 
-import inspect
+APP_VERSION = "3"  # app.py and scanner.py must carry the same version number
 
-if not (hasattr(sc, "ATR_RANGE") and hasattr(sc, "decimals")
-        and "with_info" in inspect.signature(sc.fetch).parameters):
-    st.error("scanner.py in your repository is out of date. Upload the newest scanner.py "
-             "over the old one on GitHub, then reload this page.")
+if getattr(sc, "VERSION", None) != APP_VERSION:
+    st.error(f"app.py is version {APP_VERSION} but scanner.py is version "
+             f"{getattr(sc, 'VERSION', 'older than 3')}. Upload the matching pair of files "
+             "to GitHub, wait a minute, then reload this page.")
     st.stop()
 
 DEFAULT_WATCH = ("AAPL MSFT NVDA AMD TSLA META AMZN GOOGL NFLX AVGO PLTR SMCI COIN MSTR HOOD SOFI "

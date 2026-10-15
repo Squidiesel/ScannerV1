@@ -22,6 +22,8 @@ import sys
 import numpy as np
 import pandas as pd
 
+VERSION = "3"  # app.py and scanner.py must carry the same version number
+
 
 # ---------- indicators ----------
 def atr_series(df, n=14):
