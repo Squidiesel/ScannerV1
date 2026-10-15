@@ -80,9 +80,18 @@ def find_zones(df, a, impulse=2.0):
 
 
 # ---------- play building ----------
-def build_plays(tk, d15, d1h, dd, spread=None, max_dist=8.0, buf_pct=10.0):
+ATR_RANGE = {"stock": (2, 8), "forex": (0.25, 2.5), "commodity": (0.8, 5),
+             "index": (0.6, 6), "crypto": (2, 10)}
+
+
+def decimals(price):
+    return 2 if price >= 100 else 3 if price >= 10 else 5 if price >= 1 else 6
+
+
+def build_plays(tk, d15, d1h, dd, spread=None, max_dist=8.0, buf_pct=10.0, kind="stock"):
     a = float(atr_series(d15).iloc[-1])
     price = float(d15.Close.iloc[-1])
+    nd = decimals(price)
     adv = float(dd.Volume.iloc[-21:-1].mean())
     rvol = float(dd.Volume.iloc[-1] / adv) if adv else 0.0
     atr_pct = float(atr_series(dd).iloc[-1] / dd.Close.iloc[-1] * 100)
@@ -94,13 +103,19 @@ def build_plays(tk, d15, d1h, dd, spread=None, max_dist=8.0, buf_pct=10.0):
     upd = dd.Close.iloc[-1] > emad.iloc[-1]
     dnd = dd.Close.iloc[-1] < emad.iloc[-1]
 
-    screen = [
-        price > 5,
-        adv >= 1e6,
-        rvol >= 1.5,
-        2 <= atr_pct <= 8,
-        True if spread is None else spread <= 0.1,
-    ]
+    lo, hi = ATR_RANGE.get(kind, ATR_RANGE["stock"])
+    if kind == "stock":
+        screen = [
+            price > 5,
+            adv >= 1e6,
+            rvol >= 1.5,
+            lo <= atr_pct <= hi,
+            True if spread is None else spread <= 0.1,
+        ]
+    else:
+        # forex, commodities, indices and crypto have no reliable volume feed here,
+        # so the screen only asks for enough daily movement to be worth trading.
+        screen = [lo <= atr_pct <= hi]
     screen_ok = all(screen)
 
     zones = [z for z in find_zones(d15, a) if not z["broken"]]
@@ -138,15 +153,15 @@ def build_plays(tk, d15, d1h, dd, spread=None, max_dist=8.0, buf_pct=10.0):
             z["fresh"],                                          # untouched since forming
             z["height"] <= 1.0 * a,                              # tight base
             (up1h and upd) if long else (dn1h and dnd),          # higher timeframe agrees
-            z["volx"] >= 1.5 or rvol >= 2.0,                     # volume or catalyst
+            (z["volx"] >= 1.5 or rvol >= 2.0) if kind == "stock" else z["depart"] >= 4.0,  # volume or momentum
         ]
         score = int(sum(checks))
         take = screen_ok and score >= 4 and rr >= 3
         plays.append(dict(
-            tkr=tk, side="long" if long else "short",
-            px=round(price, 2), adv=int(round(adv)), rvol=round(rvol, 2), atr=round(atr_pct, 2),
+            tkr=tk, side="long" if long else "short", kind=kind, nd=nd,
+            px=round(price, nd), adv=int(round(adv)), rvol=round(rvol, 2), atr=round(atr_pct, 2),
             spr=None if spread is None else round(spread, 3),
-            prox=round(entry, 2), dist=round(z["dist"], 2), tgt=round(tgt, 2),
+            prox=round(entry, nd), dist=round(z["dist"], nd), tgt=round(tgt, nd),
             rr=round(rr, 1), score=score, sc=[bool(x) for x in checks],
             screen=[bool(x) for x in screen], take=bool(take), tf="15m",
         ))
@@ -155,20 +170,21 @@ def build_plays(tk, d15, d1h, dd, spread=None, max_dist=8.0, buf_pct=10.0):
 
 
 # ---------- data ----------
-def fetch(tk):
+def fetch(tk, with_info=True):
     import yfinance as yf
     t = yf.Ticker(tk)
     d15 = t.history(period="10d", interval="15m")
     d1h = t.history(period="1mo", interval="1h")
     dd = t.history(period="3mo", interval="1d")
     spread = None
-    try:
-        info = t.info
-        bid, ask = info.get("bid") or 0, info.get("ask") or 0
-        if bid > 0 and ask > 0:
-            spread = (ask - bid) / ((ask + bid) / 2) * 100
-    except Exception:
-        pass
+    if with_info:
+        try:
+            info = t.info
+            bid, ask = info.get("bid") or 0, info.get("ask") or 0
+            if bid > 0 and ask > 0:
+                spread = (ask - bid) / ((ask + bid) / 2) * 100
+        except Exception:
+            pass
     return d15.dropna(), d1h.dropna(), dd.dropna(), spread
 
 
