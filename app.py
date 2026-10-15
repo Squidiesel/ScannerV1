@@ -10,6 +10,14 @@ import scanner as sc
 
 st.set_page_config(page_title="Zone Ticket", layout="centered")
 
+import inspect
+
+if not (hasattr(sc, "ATR_RANGE") and hasattr(sc, "decimals")
+        and "with_info" in inspect.signature(sc.fetch).parameters):
+    st.error("scanner.py in your repository is out of date. Upload the newest scanner.py "
+             "over the old one on GitHub, then reload this page.")
+    st.stop()
+
 DEFAULT_WATCH = ("AAPL MSFT NVDA AMD TSLA META AMZN GOOGL NFLX AVGO PLTR SMCI COIN MSTR HOOD SOFI "
                  "RKLB ASTS LUNR IONQ RGTI AVAV KTOS MRNA CRSP")
 
