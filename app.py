@@ -6,17 +6,179 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 
-import scanner as sc
+
+import numpy as np
+import pandas as pd
+
+# ================= scanner (zone detection and play building) =================
+# ---------- indicators ----------
+def atr_series(df, n=14):
+    pc = df.Close.shift()
+    tr = pd.concat([df.High - df.Low, (df.High - pc).abs(), (df.Low - pc).abs()], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+
+# ---------- zone detection ----------
+def find_zones(df, a, impulse=2.0):
+    """A zone is 1-3 small candles (the base) followed by a big candle that
+    leaves the base and travels at least `impulse` x ATR within 3 candles."""
+    o, h, l, c, v = (df[k].values for k in ("Open", "High", "Low", "Close", "Volume"))
+    n = len(df)
+    body = np.abs(c - o)
+    rng = h - l
+    small = (body <= 0.5 * a) & (rng <= 1.2 * a)
+    avgv = float(np.mean(v)) if n else 0.0
+    zones = []
+    for j in range(1, n - 1):
+        k = 0
+        while k < 3 and j - 1 - k >= 0 and small[j - 1 - k]:
+            k += 1
+        if k == 0 or body[j] < 0.8 * a:
+            continue
+        base = slice(j - k, j)
+        end = min(j + 3, n)
+        if c[j] > o[j]:
+            low = l[base].min()
+            move = h[j:end].max() - low
+            if move < impulse * a:
+                continue
+            typ, prox, dist = "demand", max(o[base].max(), c[base].max()), low
+        elif c[j] < o[j]:
+            high = h[base].max()
+            move = high - l[j:end].min()
+            if move < impulse * a:
+                continue
+            typ, prox, dist = "supply", min(o[base].min(), c[base].min()), high
+        else:
+            continue
+        height = abs(prox - dist)
+        if height < 0.05 * a:
+            continue
+        after = slice(min(j + 3, n), n)
+        if typ == "demand":
+            broken = bool((c[after] < dist).any())
+            touched = bool((l[after] <= prox).any())
+        else:
+            broken = bool((c[after] > dist).any())
+            touched = bool((h[after] >= prox).any())
+        zones.append(dict(type=typ, prox=float(prox), dist=float(dist), height=float(height),
+                          idx=j, depart=float(move / a), volx=float(v[j] / avgv) if avgv else 0.0,
+                          fresh=not touched, broken=broken))
+    return zones
+
+
+# ---------- play building ----------
+ATR_RANGE = {"stock": (2, 8), "forex": (0.25, 2.5), "commodity": (0.8, 5),
+             "index": (0.6, 6), "crypto": (2, 10)}
+
+
+def decimals(price):
+    return 2 if price >= 100 else 3 if price >= 10 else 5 if price >= 1 else 6
+
+
+def build_plays(tk, d15, d1h, dd, spread=None, max_dist=8.0, buf_pct=10.0, kind="stock"):
+    a = float(atr_series(d15).iloc[-1])
+    price = float(d15.Close.iloc[-1])
+    nd = decimals(price)
+    adv = float(dd.Volume.iloc[-21:-1].mean())
+    rvol = float(dd.Volume.iloc[-1] / adv) if adv else 0.0
+    atr_pct = float(atr_series(dd).iloc[-1] / dd.Close.iloc[-1] * 100)
+
+    ema1h = d1h.Close.ewm(span=20, adjust=False).mean()
+    up1h = d1h.Close.iloc[-1] > ema1h.iloc[-1] and ema1h.iloc[-1] > ema1h.iloc[-5]
+    dn1h = d1h.Close.iloc[-1] < ema1h.iloc[-1] and ema1h.iloc[-1] < ema1h.iloc[-5]
+    emad = dd.Close.ewm(span=20, adjust=False).mean()
+    upd = dd.Close.iloc[-1] > emad.iloc[-1]
+    dnd = dd.Close.iloc[-1] < emad.iloc[-1]
+
+    lo, hi = ATR_RANGE.get(kind, ATR_RANGE["stock"])
+    if kind == "stock":
+        screen = [
+            price > 5,
+            adv >= 1e6,
+            rvol >= 1.5,
+            lo <= atr_pct <= hi,
+            True if spread is None else spread <= 0.1,
+        ]
+    else:
+        # forex, commodities, indices and crypto have no reliable volume feed here,
+        # so the screen only asks for enough daily movement to be worth trading.
+        screen = [lo <= atr_pct <= hi]
+    screen_ok = all(screen)
+
+    zones = [z for z in find_zones(d15, a) if not z["broken"]]
+    session = d15.tail(52)  # roughly the last two sessions
+    plays = []
+    for z in zones:
+        long = z["type"] == "demand"
+        entry = z["prox"]
+        if long and not price > entry:
+            continue
+        if (not long) and not price < entry:
+            continue
+        if abs(price - entry) > max_dist * a:
+            continue
+        buf = z["height"] * buf_pct / 100
+        stop = z["dist"] - buf if long else z["dist"] + buf
+        # target: nearest opposing zone ahead of price, else the recent swing
+        opp = [x for x in zones if x["type"] == ("supply" if long else "demand")]
+        if long:
+            ahead = [x["prox"] for x in opp if x["prox"] > price]
+            tgt = min(ahead) if ahead else float(session.High.max())
+            if tgt <= entry:
+                continue
+        else:
+            ahead = [x["prox"] for x in opp if x["prox"] < price]
+            tgt = max(ahead) if ahead else float(session.Low.min())
+            if tgt >= entry:
+                continue
+        risk = abs(entry - stop)
+        if risk <= 0:
+            continue
+        rr = abs(tgt - entry) / risk
+        checks = [
+            z["depart"] >= 3.0,                                  # strong departure
+            z["fresh"],                                          # untouched since forming
+            z["height"] <= 1.0 * a,                              # tight base
+            (up1h and upd) if long else (dn1h and dnd),          # higher timeframe agrees
+            (z["volx"] >= 1.5 or rvol >= 2.0) if kind == "stock" else z["depart"] >= 4.0,  # volume or momentum
+        ]
+        score = int(sum(checks))
+        take = screen_ok and score >= 4 and rr >= 3
+        plays.append(dict(
+            tkr=tk, side="long" if long else "short", kind=kind, nd=nd,
+            px=round(price, nd), adv=int(round(adv)), rvol=round(rvol, 2), atr=round(atr_pct, 2),
+            spr=None if spread is None else round(spread, 3),
+            prox=round(entry, nd), dist=round(z["dist"], nd), tgt=round(tgt, nd),
+            rr=round(rr, 1), score=score, sc=[bool(x) for x in checks],
+            screen=[bool(x) for x in screen], take=bool(take), tf="15m",
+        ))
+    plays.sort(key=lambda p: (p["take"], p["score"], p["rr"]), reverse=True)
+    return plays
+
+
+# ---------- data ----------
+def fetch(tk, with_info=True):
+    import yfinance as yf
+    t = yf.Ticker(tk)
+    d15 = t.history(period="10d", interval="15m")
+    d1h = t.history(period="1mo", interval="1h")
+    dd = t.history(period="3mo", interval="1d")
+    spread = None
+    if with_info:
+        try:
+            info = t.info
+            bid, ask = info.get("bid") or 0, info.get("ask") or 0
+            if bid > 0 and ask > 0:
+                spread = (ask - bid) / ((ask + bid) / 2) * 100
+        except Exception:
+            pass
+    return d15.dropna(), d1h.dropna(), dd.dropna(), spread
+
+# ================= app =================
 
 st.set_page_config(page_title="Zone Ticket", layout="centered")
 
-APP_VERSION = "3"  # app.py and scanner.py must carry the same version number
-
-if getattr(sc, "VERSION", None) != APP_VERSION:
-    st.error(f"app.py is version {APP_VERSION} but scanner.py is version "
-             f"{getattr(sc, 'VERSION', 'older than 3')}. Upload the matching pair of files "
-             "to GitHub, wait a minute, then reload this page.")
-    st.stop()
 
 DEFAULT_WATCH = ("AAPL MSFT NVDA AMD TSLA META AMZN GOOGL NFLX AVGO PLTR SMCI COIN MSTR HOOD SOFI "
                  "RKLB ASTS LUNR IONQ RGTI AVAV KTOS MRNA CRSP")
@@ -224,10 +386,10 @@ def do_scan(selected, watchlist, extras, max_dist=8.0):
     def work(job):
         sym, label, m, kind = job
         try:
-            d15, d1h, dd, spr = sc.fetch(sym, with_info=(kind == "stock"))
+            d15, d1h, dd, spr = fetch(sym, with_info=(kind == "stock"))
             if len(d15) < 60 or len(d1h) < 10 or len(dd) < 25:
                 return sym, [], "not enough data"
-            ps = sc.build_plays(sym, d15, d1h, dd, spr, max_dist, kind=kind)[:2]
+            ps = build_plays(sym, d15, d1h, dd, spr, max_dist, kind=kind)[:2]
             for p in ps:
                 p["label"], p["market"] = label, m
             return sym, ps, None
@@ -333,14 +495,14 @@ with tab_scan:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load(tk):
-    return sc.fetch(tk)
+    return fetch(tk)
 
 
 def snapshot(d15, d1h, dd, spread, kind):
     price = float(d15.Close.iloc[-1])
-    atr_pct = float(sc.atr_series(dd).iloc[-1] / dd.Close.iloc[-1] * 100)
-    lo, hi = sc.ATR_RANGE[kind]
-    nd = sc.decimals(price)
+    atr_pct = float(atr_series(dd).iloc[-1] / dd.Close.iloc[-1] * 100)
+    lo, hi = ATR_RANGE[kind]
+    nd = decimals(price)
     if kind != "stock":
         return price, nd, [(f"Daily range {lo}-{hi}%", f"{atr_pct:.2f}%", lo <= atr_pct <= hi)]
     adv = float(dd.Volume.iloc[-21:-1].mean())
@@ -374,7 +536,7 @@ with tab_one:
                 for lab, val, res in rows:
                     mark = ":gray[n/a]" if res is None else (":green[PASS]" if res else ":red[FAIL]")
                     st.write(f"{mark}  {lab}: **{val}**")
-            plays = sc.build_plays(tk, d15, d1h, dd, spread, max_dist=15, kind=kind)
+            plays = build_plays(tk, d15, d1h, dd, spread, max_dist=15, kind=kind)
             for head, side in (("Buy levels", "long"), ("Sell short levels", "short")):
                 st.markdown(f"## {head}")
                 items = [p for p in plays if p["side"] == side][:2]
